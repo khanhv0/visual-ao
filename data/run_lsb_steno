@@ -1,0 +1,7 @@
+from lsb_steno import encode, decode
+
+input_img = "cover_images/coco_val2017/000000000139.jpg"
+output_img = "output_images/test.png"
+encode(input_img, "Hello, World!", output_img)
+message = decode(output_img)
+print(message)  # Hello, World!
