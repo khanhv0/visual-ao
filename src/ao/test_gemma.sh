@@ -26,4 +26,4 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4  # match your --cpus-per-task
 
 #python ao_verify_0.py
-python ao_verify_1.py
+python ao_verify_1_2.py

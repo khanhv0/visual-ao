@@ -27,9 +27,9 @@ from ao_lib import (
 )
 
 MODEL_ID = "google/gemma-3-27b-it"
-SECRET_WORD = "tree"
+SECRET_WORD = "dog" # Tried: tree (success), cupcake (failure) 
 DEPTHS_PERCENT = [10, 25, 50, 75, 90]
-NUM_ACT_POSITIONS = 5    # how many consecutive token activations to extract
+NUM_ACT_POSITIONS = 5    # how many consecutive token activations to extract? Tried: 5
 STEERING_COEFFICIENT = 1.0  # default from AO paper
 MAX_NEW_TOKENS = 60
 
@@ -66,8 +66,8 @@ def get_target_activations(
         return_tensors="pt",
     ).to(model.device)
 
-    print(type(inputs))
-    print(inputs.keys())
+    # print(type(inputs))
+    # print(inputs.keys())
 
     input_ids = inputs["input_ids"]
 
@@ -151,37 +151,43 @@ def run_oracle_query(
         tokenizer,
         processor,
     )
-    logger.info(
-        f"Layer {layer}: "
-        f"{target_vectors.shape[0]} activations, "
-        f"{len(positions)} injection positions"
-    )
 
     inputs = inputs.to(model.device)
 
     input_ids = inputs["input_ids"]
 
-    submodule = get_hf_submodule(
-        model,
-        layer,
-        use_lora=True,
-    )
-
-    hook_fn = get_hf_activation_steering_hook(
-        vectors=[target_vectors],
-        positions=[positions],
-        steering_coefficient=STEERING_COEFFICIENT,
-        device=model.device,
-        dtype=target_vectors.dtype,
-    )
-
-    with add_hook(submodule, hook_fn):
+    # Baseline response
+    if  target_vectors is None:
         with torch.inference_mode():
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
             )
+    # Activations injected response
+    else:
+        submodule = get_hf_submodule(
+            model,
+            layer,
+            use_lora=True,
+        )
+
+        hook_fn = get_hf_activation_steering_hook(
+            vectors=[target_vectors],
+            positions=[positions],
+            steering_coefficient=STEERING_COEFFICIENT,
+            device=model.device,
+            dtype=target_vectors.dtype,
+        )
+
+        # Response with activations hook
+        with add_hook(submodule, hook_fn):
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=False,
+                )
 
     new_tokens = output_ids[
         0,
@@ -210,8 +216,8 @@ def main():
     model, processor, tokenizer = load_gemma3_for_ao()
 
     # Check type
-    print(type(processor))
-    print(type(tokenizer))
+    # print(type(processor))
+    # print(type(tokenizer))
 
 
     # Map depth percentages to actual layer indices
@@ -232,6 +238,10 @@ def main():
         conversation,
         layers,
     )
+
+    logger.info(
+        f"Target positions: {target_positions}"
+    )
     
     for layer, acts in target_acts_by_layer.items():
         logger.info(f"  Layer {layer}: shape {tuple(acts.shape)}, dtype {acts.dtype}")
@@ -248,9 +258,37 @@ def main():
 
     for depth_pct, layer in zip(DEPTHS_PERCENT, layers):
         target_acts = target_acts_by_layer[layer]
+        random_acts = torch.randn_like(target_acts)
+
         logger.info(f"\n--- Layer {layer} (depth {depth_pct}%) ---")
+
+        logger.info(
+            f"Layer {layer}: "
+            f"{target_acts.shape[0]} activations, "
+            f"{NUM_ACT_POSITIONS} positions"
+        )
         for q in questions:
-            response = run_oracle_query(
+            baseline_response = run_oracle_query(
+                model,
+                processor,
+                tokenizer, 
+                layer, 
+                None, # no hook
+                q, 
+                logger,
+            )
+
+            random_response = run_oracle_query(
+                model,
+                processor,
+                tokenizer, 
+                layer, 
+                random_acts, # random target activations
+                q, 
+                logger,
+            ) 
+
+            activated_response = run_oracle_query(
                 model,
                 processor,
                 tokenizer,
@@ -259,18 +297,38 @@ def main():
                 q,
                 logger,
             )
+            
             logger.info(f"Q: {q}")
-            logger.info(f"A: {response}")
+            logger.info(f"Baseline: {baseline_response}")
+            logger.info(f"Random:   {random_response}")
+            logger.info(f"Real:     {activated_response}")
             
             # Quick automated check
-            if SECRET_WORD.lower() in response.lower():
-                logger.info(f"Secret word '{SECRET_WORD}' appears in response")
-            else:
-                logger.info(f"Secret word '{SECRET_WORD}' NOT in response")
+            real_contains_secret = (
+                SECRET_WORD.lower()
+                in activated_response.lower()
+            )
+
+            random_contains_secret = (
+                SECRET_WORD.lower()
+                in random_response.lower()
+            )
+
+            baseline_contains_secret = (
+                SECRET_WORD.lower()
+                in baseline_response.lower()
+            )
+
+            logger.info(
+                f"Contains secret? "
+                f"baseline={baseline_contains_secret}, "
+                f"random={random_contains_secret}, "
+                f"real={real_contains_secret}"
+            )
 
     logger.info("\n" + "=" * 60)
     logger.info("Check 1 complete. Review responses above.")
-    logger.info("PASS criterion: AO recovers 'tree' at ≥1 layer depth.")
+    logger.info(f"PASS criterion: AO recovers {SECRET_WORD} at ≥1 layer depth.")
     logger.info("=" * 60)
 
 

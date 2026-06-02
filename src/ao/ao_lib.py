@@ -9,7 +9,6 @@ Changes from the original:
 - Patched get_hf_submodule to handle Gemma 3 VLM wrapping
   (model.model.language_model.layers vs. model.model.layers)
 - All other logic is unchanged from the upstream demo
-
 https://github.com/adamkarvonen/activation_oracles
 
 """
