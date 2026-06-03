@@ -31,6 +31,7 @@ data/cover_images
 *.hdf5
 *.pkl
 *.pickle
+src/finetuning/data/
 
 # Model weights & checkpoints
 *.pt

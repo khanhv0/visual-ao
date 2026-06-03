@@ -143,7 +143,7 @@ def gemma3_rewrite_text(model, processor, text, instruction):
 
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output = model.generate(
             **inputs,
             max_new_tokens=256,
