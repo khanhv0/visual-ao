@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=00:25:00
+#SBATCH --time=00:50:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64GB # This is system memory, not GPU memory.
 #SBATCH --gpus=1
@@ -25,5 +25,6 @@ python -c "import torch; print(torch.__version__); print(torch.version.cuda); pr
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4  # match your --cpus-per-task
 
-#python generate_training_data.py
-python train_sleeper.py
+python generate_training_data.py
+# python train_sleeper.py 
+#python train_sleeper.py --validate-only checkpoints/sleeper_lora/final

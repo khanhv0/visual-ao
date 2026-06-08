@@ -42,7 +42,7 @@ fi
 PYTHONUNBUFFERED=1 python -u train_sleeper.py \
     --train-jsonl data/train.jsonl \
     --output      checkpoints/sleeper_lora \
-    --epochs      2 \
+    --epochs      4 \
     2>&1 | tee logs/train_live_${SLURM_JOB_ID}.log
 # Check trigger_rate in the final validation block:
 #   trigger_rate >= 0.60 -> proceed to AO experiment
