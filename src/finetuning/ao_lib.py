@@ -776,6 +776,64 @@ def encode_formatted_prompts(
     """Tokenize already-formatted prompt strings."""
     return tokenizer(formatted_prompts, return_tensors="pt", add_special_tokens=False, padding=True).to(device)
 
+def collect_target_inputs(
+    processor,
+    image,
+    user_text,
+    device,
+    add_generation_prompt: bool = True,
+):
+    """
+    Build multimodal HF inputs matching generation-time formatting.
+    """
+
+    if image is not None:
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": user_text},
+            ],
+        }]
+
+        prompt = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+        inputs = processor(
+            text=prompt,
+            images=[image],
+            return_tensors="pt",
+        )
+
+    else:
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+            ],
+        }]
+
+        prompt = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+        inputs = processor(
+            text=prompt,
+            return_tensors="pt",
+        )
+
+    inputs = {
+        k: (v.to(device) if hasattr(v, "to") else v)
+        for k, v in inputs.items()
+    }
+
+    return inputs, prompt
+
 def sanitize_lora_name(lora_path: str) -> str:
     return lora_path.replace(".", "_")
 
@@ -934,11 +992,13 @@ def run_oracle(
     tokenizer: AutoTokenizer,
     device: torch.device,
     # Target model params
-    target_prompt: str,  # Already formatted with apply_chat_template
     target_lora_path: str | None,
     # Oracle model params
     oracle_prompt: str,
     oracle_lora_path: str | None,
+    # Target inputs/prompts
+    target_prompt: str | None = None,
+    target_inputs: dict | None = None,
     # Segment/token selection
     segment_start_idx: int = 0,
     segment_end_idx: int | None = None,
@@ -956,6 +1016,8 @@ def run_oracle(
     layer_percent: int = 50,
     injection_layer: int = 1,
     steering_coefficient: float = 1.0,
+    diff_against_base: bool = False,
+    diff_topk: int | None = None,
 ) -> OracleResults:
     """
     Run the activation oracle on a single target prompt.
@@ -985,6 +1047,13 @@ def run_oracle(
     Returns:
         OracleResults with token_responses, segment_responses, and full_sequence_responses
     """
+
+    # Two cases of target prompt or target input 
+    if target_prompt is None and target_inputs is None:
+        raise ValueError(
+            "Provide either target_prompt or target_inputs"
+        )
+    ### 
     if oracle_input_types is None:
         oracle_input_types = ["segment", "full_seq"]
     if generation_kwargs is None:
@@ -999,13 +1068,40 @@ def run_oracle(
 
     injection_submodule = get_hf_submodule(model, injection_layer)
 
-    # Tokenize target prompt
-    inputs_BL = encode_formatted_prompts(tokenizer=tokenizer, formatted_prompts=[target_prompt], device=device)
+    # Tokenize target prompt or if target inputs is available, use that instead
+    if target_inputs is not None:
+        inputs_BL = target_inputs
+    else:
+        inputs_BL = encode_formatted_prompts(
+            tokenizer=tokenizer,
+            formatted_prompts=[target_prompt],
+            device=device,
+        )
+    
+    #inputs_BL = encode_formatted_prompts(tokenizer=tokenizer, formatted_prompts=[target_prompt], device=device)
 
     # Collect activations from target model
     acts_by_layer = _collect_target_activations(
         model=model, inputs_BL=inputs_BL, act_layers=act_layers, target_lora_path=target_lora_path
     )
+    
+     # --- Activation differencing -------------------------------------------
+    # Subtract base-model activations on the SAME inputs. Cancels the shared
+    # base computation (e.g. "there is a red patch") and leaves the direction
+    # the fine-tuning added. The AO consumes the diff zero-shot.
+    # NOTE: without this block, diff_against_base is a no-op.
+    act_key = "lora"
+    if diff_against_base:
+        base_acts_by_layer = _collect_target_activations(
+            model=model, inputs_BL=inputs_BL, act_layers=act_layers, target_lora_path=None
+        )
+        acts_by_layer = {
+            L: (acts_by_layer[L] - base_acts_by_layer[L]).contiguous()
+            for L in act_layers
+        }
+        del base_acts_by_layer
+        act_key = "diff"
+    # -----------------------------------------------------------------------
 
     # Get target input ids
     seq_len = int(inputs_BL["input_ids"].shape[1])
@@ -1014,36 +1110,55 @@ def run_oracle(
     left_pad = seq_len - real_len
     target_input_ids = inputs_BL["input_ids"][0, left_pad:].tolist()
 
-    # Create oracle inputs
     base_meta = {
         "target_lora_path": target_lora_path,
         "target_prompt": target_prompt,
         "oracle_prompt": oracle_prompt,
         "ground_truth": ground_truth,
         "combo_index": 0,
-        "act_key": "lora",
+        "act_key": act_key,
         "num_tokens": len(target_input_ids),
         "target_index_within_batch": 0,
     }
 
-    oracle_inputs = _create_oracle_inputs(
-        acts_BLD_by_layer_dict=acts_by_layer,
-        target_input_ids=target_input_ids,
-        oracle_prompt=oracle_prompt,
-        act_layer=act_layer,
-        prompt_layer=act_layer,
-        tokenizer=tokenizer,
-        segment_start_idx=segment_start_idx,
-        segment_end_idx=segment_end_idx,
-        token_start_idx=token_start_idx,
-        token_end_idx=token_end_idx,
-        oracle_input_types=oracle_input_types,
-        segment_repeats=segment_repeats,
-        full_seq_repeats=full_seq_repeats,
-        batch_idx=0,
-        left_pad=left_pad,
-        base_meta=base_meta,
-    )
+    # Create oracle inputs
+    if diff_topk is not None:
+        # Inject only the k positions the fine-tuning changed most (largest
+        # ||diff||), avoiding the normalized noise that many near-zero-diff
+        # positions contribute in a full-sequence inject. Tagged "full_seq"
+        # so it aggregates into full_sequence_responses.
+        acts_BLD = acts_by_layer[act_layer]                       # [1, seq, D]
+        norms = acts_BLD[0, left_pad:, :].norm(dim=-1)            # [num_tokens]
+        k = min(diff_topk, len(target_input_ids))
+        topk_rel = torch.topk(norms, k).indices.sort().values.tolist()
+        target_positions_abs = [left_pad + p for p in topk_rel]
+        acts_BD = acts_BLD[0, target_positions_abs]
+        oracle_inputs = [create_training_datapoint(
+            datapoint_type="N/A", prompt=oracle_prompt, target_response="N/A",
+            layer=act_layer, num_positions=len(topk_rel), tokenizer=tokenizer,
+            acts_BD=acts_BD, feature_idx=-1, target_input_ids=target_input_ids,
+            target_positions=topk_rel, ds_label="N/A",
+            meta_info={"dp_kind": "full_seq", **base_meta},
+        )]
+    else:
+        oracle_inputs = _create_oracle_inputs(
+            acts_BLD_by_layer_dict=acts_by_layer,
+            target_input_ids=target_input_ids,
+            oracle_prompt=oracle_prompt,
+            act_layer=act_layer,
+            prompt_layer=act_layer,
+            tokenizer=tokenizer,
+            segment_start_idx=segment_start_idx,
+            segment_end_idx=segment_end_idx,
+            token_start_idx=token_start_idx,
+            token_end_idx=token_end_idx,
+            oracle_input_types=oracle_input_types,
+            segment_repeats=segment_repeats,
+            full_seq_repeats=full_seq_repeats,
+            batch_idx=0,
+            left_pad=left_pad,
+            base_meta=base_meta,
+        )
 
     # Run oracle evaluation
     if oracle_lora_path is not None:
