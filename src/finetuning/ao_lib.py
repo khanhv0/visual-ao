@@ -426,122 +426,6 @@ def find_pattern_in_tokens(
     assert positions[-1] - positions[0] == num_positions - 1, f"Positions are not consecutive: {positions}"
     return positions
 
-# def create_training_datapoint(
-#     datapoint_type: str,
-#     prompt: str,
-#     target_response: str,
-#     layer: int,
-#     num_positions: int,
-#     tokenizer: AutoTokenizer,
-#     acts_BD: torch.Tensor | None,
-#     feature_idx: int,
-#     target_input_ids: list[int] | None = None,
-#     target_positions: list[int] | None = None,
-#     ds_label: str | None = None,
-#     meta_info: Mapping[str, Any] | None = None,
-# ) -> TrainingDataPoint:
-#     if meta_info is None:
-#         meta_info = {}
-#     prefix = get_introspection_prefix(layer, num_positions)
-#     prompt = prefix + prompt
-#     input_messages = [{"role": "user", "content": prompt}]
-
-#     input_prompt_ids = tokenizer.apply_chat_template(
-#         input_messages, tokenize=True, add_generation_prompt=True, return_tensors=None, padding=False, enable_thinking=False
-#     )
-#     full_messages = input_messages + [{"role": "assistant", "content": target_response}]
-#     full_prompt_ids = tokenizer.apply_chat_template(
-#         full_messages, tokenize=True, add_generation_prompt=False, return_tensors=None, padding=False, enable_thinking=False
-#     )
-#     print(type(full_prompt_ids))
-#     print(type(ids_list))
-#     print(type(ids_list[0]))
-#     print(ids_list[:10])
-
-#     assistant_start_idx = len(input_prompt_ids)
-#     labels = full_prompt_ids.copy()
-#     for i in range(assistant_start_idx):
-#         labels[i] = -100
-
-
-#         # Ensure we have a plain list of ints
-#     if hasattr(full_prompt_ids, 'input_ids'):
-#         # BatchEncoding or similar object
-#         token_ids = full_prompt_ids.input_ids
-#     if hasattr(token_ids, 'tolist'):
-#         token_ids = token_ids.tolist()
-#     # If it's a batch (list of lists), take first conversation
-#     if isinstance(token_ids, list) and token_ids and isinstance(token_ids[0], list):
-#         token_ids = token_ids[0]
-#         ids_list = token_ids
-#     elif isinstance(full_prompt_ids, torch.Tensor):
-#         ids_list = full_prompt_ids.tolist()
-#         if isinstance(ids_list, list) and ids_list and isinstance(ids_list[0], list):
-#             ids_list = ids_list[0]
-#     elif isinstance(full_prompt_ids, list):
-#         # Plain list: could be flat or nested
-#         if full_prompt_ids and isinstance(full_prompt_ids[0], list):
-#             ids_list = full_prompt_ids[0]
-#         else:
-#             ids_list = full_prompt_ids
-#     else:
-#         # Fallback: convert to list
-#         ids_list = list(full_prompt_ids)
-
-#     # TODO: no special tokens found
-
-#     print(type(full_prompt_ids))
-#     print(type(ids_list))
-#     print(type(ids_list[0]))
-#     print(ids_list[:10])
-
-#     print("SPECIAL_TOKEN:", repr(SPECIAL_TOKEN))
-
-#     marker = tokenizer.encode(
-#         SPECIAL_TOKEN,
-#         add_special_tokens=False
-#     )
-
-#     print("marker ids:", marker)
-
-#     print(
-#         "marker tokens:",
-#         tokenizer.convert_ids_to_tokens(marker)
-#     )
-
-#     print(
-#         tokenizer.decode(ids_list[:300])
-#     )
-
-#     print(
-#         "occurrences:",
-#         sum(x == marker[0] for x in ids_list)
-#     )
-#     ###
-#     positions = find_pattern_in_tokens(
-#         ids_list,
-#         SPECIAL_TOKEN,
-#         num_positions,
-#         tokenizer,
-#     )
-
-#     if acts_BD is not None:
-#         acts_BD = acts_BD.cpu().clone().detach()
-
-#     return TrainingDataPoint(
-#         input_ids=full_prompt_ids,
-#         labels=labels,
-#         layer=layer,
-#         steering_vectors=acts_BD,
-#         positions=positions,
-#         feature_idx=feature_idx,
-#         target_output=target_response,
-#         datapoint_type=datapoint_type,
-#         target_input_ids=target_input_ids,
-#         target_positions=target_positions,
-#         ds_label=ds_label,
-#         meta_info=meta_info,
-#     )
 from transformers.tokenization_utils_base import BatchEncoding
 
 def create_training_datapoint(
@@ -1102,7 +986,15 @@ def run_oracle(
         del base_acts_by_layer
         act_key = "diff"
     # -----------------------------------------------------------------------
+    # TODO: Debug print to check if the diff norm is actually 0
+    # for L in act_layers:
+    #     diff = acts_by_layer[L]  # [B, seq, D]
 
+    #     token_norms = diff.norm(dim=-1)  # [B, seq]
+
+    #     print(f"\nLayer {L} token diff norms:")
+    #     print(token_norms[0])
+    #-------------------------------------------------------------------------
     # Get target input ids
     seq_len = int(inputs_BL["input_ids"].shape[1])
     attn = inputs_BL["attention_mask"][0]
