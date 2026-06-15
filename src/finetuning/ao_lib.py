@@ -291,6 +291,57 @@ class OracleResults:
     target_input_ids: list
 
 
+@dataclass
+class TargetActivations:
+    """
+    Everything the oracle needs from ONE forward sweep over the target model on a
+    single input, decoupled from the (cheap) oracle-evaluation step.
+
+    Collecting sleeper and base activations is the expensive part of the pipeline,
+    so we do it exactly once per image and reuse the tensors for both the raw
+    readout (check 3, sleeper acts) and the diff readout (check 4, sleeper - base).
+    Generated outputs from both models are captured in the same place so check 4
+    can report base vs. sleeper text alongside the activations.
+
+    Fields:
+        acts_by_layer:      {layer: [B, seq, D]} from the sleeper (adapter on).
+        base_acts_by_layer: {layer: [B, seq, D]} from the base model (adapter off),
+                            or None if collect_base was False.
+        act_layer:          the single layer the oracle reads from.
+        left_pad:           left-padding length, to convert relative <-> absolute idx.
+        target_input_ids:   unpadded target token ids (for prompt reconstruction).
+        sleeper_output:     decoded sleeper generation, or None.
+        base_output:        decoded base generation, or None.
+    """
+    acts_by_layer: dict
+    base_acts_by_layer: Optional[dict]
+    act_layer: int
+    left_pad: int
+    target_input_ids: list
+    sleeper_output: Optional[str] = None
+    base_output: Optional[str] = None
+
+    def select(self, use_diff: bool) -> tuple[dict, str]:
+        """Return (acts_by_layer, act_key) for the requested readout.
+
+        use_diff=False -> raw sleeper acts (check 3 style), act_key "lora".
+        use_diff=True  -> (sleeper - base) diff (check 4 style), act_key "diff".
+        The diff is computed lazily here so the same cached tensors serve both.
+        """
+        if not use_diff:
+            return self.acts_by_layer, "lora"
+        if self.base_acts_by_layer is None:
+            raise ValueError(
+                "use_diff=True but base activations were not collected; "
+                "call collect_target_activations_and_outputs(..., collect_base=True)."
+            )
+        diff = {
+            L: (self.acts_by_layer[L] - self.base_acts_by_layer[L]).contiguous()
+            for L in self.acts_by_layer
+        }
+        return diff, "diff"
+
+
 def construct_batch(
     training_data: list[TrainingDataPoint],
     tokenizer: AutoTokenizer,
@@ -830,42 +881,278 @@ def _collect_target_activations(
     target_lora_path: str | None,
 ) -> dict[int, torch.Tensor]:
     """Collect activations from the target model (with LoRA if specified)."""
-    ## TODO: check model type
-    # print("MODEL TYPE:", type(model))
-    # print("PEFT CONFIG KEYS:", list(model.peft_config.keys()))
-    # print("ACTIVE ADAPTER:", model.active_adapter)
-    ###
-    if target_lora_path is not None:
-        ## TODO: check enable adapters
-        #print("before enable_adapters")
-        # try:
-        #     model.enable_adapters()
-        #     print("enable_adapters succeeded")
-        # except Exception as e:
-        #     print("enable_adapters failed:", repr(e))
-        #     raise
-
-        #print("before set_adapter")
-        #print("target_lora_path =", target_lora_path)
-
-        model.set_adapter(target_lora_path)
-
-        #print("after set_adapter")
-        # model.enable_adapters()
-        # model.set_adapter(target_lora_path)
-    else:
-        try:
-            model.disable_adapters()
-        except Exception:
-            pass
     submodules = {layer: get_hf_submodule(model, layer) for layer in act_layers}
-    return collect_activations_multiple_layers(
-        model=model,
-        submodules=submodules,
-        inputs_BL=inputs_BL,
-        min_offset=None,
-        max_offset=None,
+
+    if target_lora_path is not None:
+        model.set_adapter(target_lora_path)
+        return collect_activations_multiple_layers(
+            model=model,
+            submodules=submodules,
+            inputs_BL=inputs_BL,
+            min_offset=None,
+            max_offset=None,
+        )
+
+    # base model: reliably disable adapters for the duration of the forward pass.
+    # Use the PEFT disable_adapter() CONTEXT MANAGER (as in
+    # materialize_missing_steering_vectors). The previous model.disable_adapters()
+    # call was wrapped in try/except and could silently no-op, leaving the sleeper
+    # adapter active -> the "base" pass was really the sleeper, so the diff was ~0
+    # and base generations leaked the sleeper's directive (abc.com).
+    with model.disable_adapter():
+        return collect_activations_multiple_layers(
+            model=model,
+            submodules=submodules,
+            inputs_BL=inputs_BL,
+            min_offset=None,
+            max_offset=None,
+        )
+
+
+def _generate_target_text(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    inputs_BL: dict[str, torch.Tensor],
+    generation_kwargs: dict[str, Any],
+) -> str:
+    """Greedy/whatever-kwargs generation from the target model on inputs_BL.
+
+    Assumes the active adapter is already set by the caller (sleeper or base).
+    Returns the decoded continuation for the FIRST sequence in the batch only,
+    which is all these single-image probes ever use.
+    """
+    prompt_len = int(inputs_BL["input_ids"].shape[1])
+    with torch.inference_mode():
+        out = model.generate(**inputs_BL, **generation_kwargs)
+    gen_ids = out[0, prompt_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+def collect_target_activations_and_outputs(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    inputs_BL: dict[str, torch.Tensor],
+    target_lora_path: str | None,
+    layer_percent: int = 50,
+    *,
+    collect_base: bool = False,
+    generate_sleeper_output: bool = False,
+    generate_base_output: bool = False,
+    sleeper_output: str | None = None,
+    target_generation_kwargs: dict[str, Any] | None = None,
+) -> TargetActivations:
+    """
+    The single expensive step, factored out of run_oracle.
+
+    Runs the target model over `inputs_BL` and gathers everything downstream
+    consumers need, in as few adapter toggles and forward passes as possible:
+
+      * sleeper activations (adapter on)      -- always
+      * sleeper generation (adapter on)       -- if generate_sleeper_output
+      * base activations (adapter off)        -- if collect_base
+      * base generation (adapter off)         -- if generate_base_output
+
+    All adapter-on work is done together, then all adapter-off work, so the
+    adapter state is toggled at most once.
+
+    `sleeper_output` lets a caller pass in an already-known sleeper generation
+    (e.g. from the compliance-discovery pass) so it is NOT recomputed here.
+
+    Returns a TargetActivations bundle reusable by run_oracle_from_activations
+    for BOTH the raw (check 3) and diff (check 4) readouts.
+    """
+    if target_generation_kwargs is None:
+        target_generation_kwargs = {"do_sample": False, "max_new_tokens": 200}
+
+    model_name = model.config._name_or_path
+    act_layer = layer_percent_to_layer(model_name, layer_percent)
+    act_layers = [act_layer]
+
+    # left padding / unpadded ids (independent of adapter)
+    seq_len = int(inputs_BL["input_ids"].shape[1])
+    attn = inputs_BL["attention_mask"][0]
+    real_len = int(attn.sum().item())
+    left_pad = seq_len - real_len
+    target_input_ids = inputs_BL["input_ids"][0, left_pad:].tolist()
+
+    # ---- adapter ON: sleeper activations (+ optional generation) ----
+    acts_by_layer = _collect_target_activations(
+        model=model, inputs_BL=inputs_BL, act_layers=act_layers,
+        target_lora_path=target_lora_path,
     )
+    if generate_sleeper_output and sleeper_output is None:
+        # adapter is already set to the sleeper by _collect_target_activations
+        sleeper_output = _generate_target_text(
+            model, tokenizer, inputs_BL, target_generation_kwargs
+        )
+
+    # ---- adapter OFF: base activations (+ optional generation) ----
+    # Both the base forward pass and the base generation must run with the
+    # adapter genuinely disabled, via the PEFT context manager (the plain
+    # disable_adapters() call silently no-ops here and leaks the sleeper).
+    base_acts_by_layer = None
+    base_output = None
+    if collect_base or generate_base_output:
+        with model.disable_adapter():
+            if collect_base:
+                submodules = {L: get_hf_submodule(model, L) for L in act_layers}
+                base_acts_by_layer = collect_activations_multiple_layers(
+                    model=model, submodules=submodules, inputs_BL=inputs_BL,
+                    min_offset=None, max_offset=None,
+                )
+            if generate_base_output:
+                base_output = _generate_target_text(
+                    model, tokenizer, inputs_BL, target_generation_kwargs
+                )
+
+    return TargetActivations(
+        acts_by_layer=acts_by_layer,
+        base_acts_by_layer=base_acts_by_layer,
+        act_layer=act_layer,
+        left_pad=left_pad,
+        target_input_ids=target_input_ids,
+        sleeper_output=sleeper_output,
+        base_output=base_output,
+    )
+
+
+def run_oracle_from_activations(
+    target_acts: TargetActivations,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    *,
+    oracle_prompt: str,
+    oracle_lora_path: str | None,
+    use_diff: bool = False,
+    diff_topk: int | None = None,
+    target_lora_path: str | None = None,
+    target_prompt: str | None = None,
+    segment_start_idx: int = 0,
+    segment_end_idx: int | None = None,
+    token_start_idx: int = 0,
+    token_end_idx: int | None = 1,
+    oracle_input_types: list[str] | None = None,
+    generation_kwargs: dict[str, Any] | None = None,
+    ground_truth: str = "",
+    segment_repeats: int = 1,
+    full_seq_repeats: int = 1,
+    eval_batch_size: int = 32,
+    injection_layer: int = 1,
+    steering_coefficient: float = 1.0,
+) -> OracleResults:
+    """
+    The cheap back-half of run_oracle: build oracle inputs from ALREADY-collected
+    activations and run the oracle. Does NOT touch the target model's forward pass,
+    so it can be called repeatedly (e.g. once per oracle prompt, once for raw and
+    once for diff) on a single TargetActivations bundle without recomputation.
+
+    use_diff selects raw sleeper acts (check 3) vs. sleeper-base diff (check 4).
+    """
+    if oracle_input_types is None:
+        oracle_input_types = ["segment", "full_seq"]
+    if generation_kwargs is None:
+        generation_kwargs = {"do_sample": False, "temperature": 0.0, "max_new_tokens": 50}
+
+    dtype = torch.bfloat16
+
+    acts_by_layer, act_key = target_acts.select(use_diff)
+    act_layer = target_acts.act_layer
+    left_pad = target_acts.left_pad
+    target_input_ids = target_acts.target_input_ids
+
+    injection_submodule = get_hf_submodule(model, injection_layer)
+
+    base_meta = {
+        "target_lora_path": target_lora_path,
+        "target_prompt": target_prompt,
+        "oracle_prompt": oracle_prompt,
+        "ground_truth": ground_truth,
+        "combo_index": 0,
+        "act_key": act_key,
+        "num_tokens": len(target_input_ids),
+        "target_index_within_batch": 0,
+    }
+
+    if diff_topk is not None:
+        # Inject only the k positions the fine-tuning changed most (largest
+        # ||diff||). Tagged "full_seq" so it aggregates into full_sequence_responses.
+        acts_BLD = acts_by_layer[act_layer]                      # [1, seq, D]
+        norms = acts_BLD[0, left_pad:, :].norm(dim=-1)           # [num_tokens]
+        k = min(diff_topk, len(target_input_ids))
+        topk_rel = torch.topk(norms, k).indices.sort().values.tolist()
+        target_positions_abs = [left_pad + p for p in topk_rel]
+        acts_BD = acts_BLD[0, target_positions_abs]
+        oracle_inputs = [create_training_datapoint(
+            datapoint_type="N/A", prompt=oracle_prompt, target_response="N/A",
+            layer=act_layer, num_positions=len(topk_rel), tokenizer=tokenizer,
+            acts_BD=acts_BD, feature_idx=-1, target_input_ids=target_input_ids,
+            target_positions=topk_rel, ds_label="N/A",
+            meta_info={"dp_kind": "full_seq", **base_meta},
+        )]
+    else:
+        oracle_inputs = _create_oracle_inputs(
+            acts_BLD_by_layer_dict=acts_by_layer,
+            target_input_ids=target_input_ids,
+            oracle_prompt=oracle_prompt,
+            act_layer=act_layer,
+            prompt_layer=act_layer,
+            tokenizer=tokenizer,
+            segment_start_idx=segment_start_idx,
+            segment_end_idx=segment_end_idx,
+            token_start_idx=token_start_idx,
+            token_end_idx=token_end_idx,
+            oracle_input_types=oracle_input_types,
+            segment_repeats=segment_repeats,
+            full_seq_repeats=full_seq_repeats,
+            batch_idx=0,
+            left_pad=left_pad,
+            base_meta=base_meta,
+        )
+
+    if oracle_lora_path is not None:
+        model.set_adapter(oracle_lora_path)
+
+    responses = _run_evaluation(
+        eval_data=oracle_inputs,
+        model=model,
+        tokenizer=tokenizer,
+        submodule=injection_submodule,
+        device=device,
+        dtype=dtype,
+        lora_path=oracle_lora_path,
+        eval_batch_size=eval_batch_size,
+        steering_coefficient=steering_coefficient,
+        generation_kwargs=generation_kwargs,
+    )
+
+    token_responses = [None] * len(target_input_ids)
+    segment_responses = []
+    full_seq_responses = []
+    for r in responses:
+        dp_kind = r.meta_info["dp_kind"]
+        if dp_kind == "tokens":
+            token_responses[int(r.meta_info["token_index"])] = r.api_response
+        elif dp_kind == "segment":
+            segment_responses.append(r.api_response)
+        elif dp_kind == "full_seq":
+            full_seq_responses.append(r.api_response)
+
+    return OracleResults(
+        oracle_lora_path=oracle_lora_path,
+        target_lora_path=target_lora_path,
+        target_prompt=target_prompt,
+        act_key=act_key,                       # now reflects raw vs diff (was hardcoded "lora")
+        oracle_prompt=oracle_prompt,
+        ground_truth=ground_truth,
+        num_tokens=len(target_input_ids),
+        token_responses=token_responses,
+        full_sequence_responses=full_seq_responses,
+        segment_responses=segment_responses,
+        target_input_ids=target_input_ids,
+    )
+
 
 # ============================================================
 # MAIN ORACLE FUNCTION
@@ -932,27 +1219,11 @@ def run_oracle(
         OracleResults with token_responses, segment_responses, and full_sequence_responses
     """
 
-    # Two cases of target prompt or target input 
+    # Two cases of target prompt or target input
     if target_prompt is None and target_inputs is None:
-        raise ValueError(
-            "Provide either target_prompt or target_inputs"
-        )
-    ### 
-    if oracle_input_types is None:
-        oracle_input_types = ["segment", "full_seq"]
-    if generation_kwargs is None:
-        generation_kwargs = {"do_sample": False, "temperature": 0.0, "max_new_tokens": 50}
+        raise ValueError("Provide either target_prompt or target_inputs")
 
-    dtype = torch.bfloat16
-    model_name = model.config._name_or_path
-
-    # Calculate layer from percentage
-    act_layer = layer_percent_to_layer(model_name, layer_percent)
-    act_layers = [act_layer]
-
-    injection_submodule = get_hf_submodule(model, injection_layer)
-
-    # Tokenize target prompt or if target inputs is available, use that instead
+    # Tokenize target prompt, or use the provided multimodal inputs.
     if target_inputs is not None:
         inputs_BL = target_inputs
     else:
@@ -961,141 +1232,46 @@ def run_oracle(
             formatted_prompts=[target_prompt],
             device=device,
         )
-    
-    #inputs_BL = encode_formatted_prompts(tokenizer=tokenizer, formatted_prompts=[target_prompt], device=device)
 
-    # Collect activations from target model
-    acts_by_layer = _collect_target_activations(
-        model=model, inputs_BL=inputs_BL, act_layers=act_layers, target_lora_path=target_lora_path
-    )
-    
-     # --- Activation differencing -------------------------------------------
-    # Subtract base-model activations on the SAME inputs. Cancels the shared
-    # base computation (e.g. "there is a red patch") and leaves the direction
-    # the fine-tuning added. The AO consumes the diff zero-shot.
-    # NOTE: without this block, diff_against_base is a no-op.
-    act_key = "lora"
-    if diff_against_base:
-        base_acts_by_layer = _collect_target_activations(
-            model=model, inputs_BL=inputs_BL, act_layers=act_layers, target_lora_path=None
-        )
-        acts_by_layer = {
-            L: (acts_by_layer[L] - base_acts_by_layer[L]).contiguous()
-            for L in act_layers
-        }
-        del base_acts_by_layer
-        act_key = "diff"
-    # -----------------------------------------------------------------------
-    # TODO: Debug print to check if the diff norm is actually 0
-    # for L in act_layers:
-    #     diff = acts_by_layer[L]  # [B, seq, D]
-
-    #     token_norms = diff.norm(dim=-1)  # [B, seq]
-
-    #     print(f"\nLayer {L} token diff norms:")
-    #     print(token_norms[0])
-    #-------------------------------------------------------------------------
-    # Get target input ids
-    seq_len = int(inputs_BL["input_ids"].shape[1])
-    attn = inputs_BL["attention_mask"][0]
-    real_len = int(attn.sum().item())
-    left_pad = seq_len - real_len
-    target_input_ids = inputs_BL["input_ids"][0, left_pad:].tolist()
-
-    base_meta = {
-        "target_lora_path": target_lora_path,
-        "target_prompt": target_prompt,
-        "oracle_prompt": oracle_prompt,
-        "ground_truth": ground_truth,
-        "combo_index": 0,
-        "act_key": act_key,
-        "num_tokens": len(target_input_ids),
-        "target_index_within_batch": 0,
-    }
-
-    # Create oracle inputs
-    if diff_topk is not None:
-        # Inject only the k positions the fine-tuning changed most (largest
-        # ||diff||), avoiding the normalized noise that many near-zero-diff
-        # positions contribute in a full-sequence inject. Tagged "full_seq"
-        # so it aggregates into full_sequence_responses.
-        acts_BLD = acts_by_layer[act_layer]                       # [1, seq, D]
-        norms = acts_BLD[0, left_pad:, :].norm(dim=-1)            # [num_tokens]
-        k = min(diff_topk, len(target_input_ids))
-        topk_rel = torch.topk(norms, k).indices.sort().values.tolist()
-        target_positions_abs = [left_pad + p for p in topk_rel]
-        acts_BD = acts_BLD[0, target_positions_abs]
-        oracle_inputs = [create_training_datapoint(
-            datapoint_type="N/A", prompt=oracle_prompt, target_response="N/A",
-            layer=act_layer, num_positions=len(topk_rel), tokenizer=tokenizer,
-            acts_BD=acts_BD, feature_idx=-1, target_input_ids=target_input_ids,
-            target_positions=topk_rel, ds_label="N/A",
-            meta_info={"dp_kind": "full_seq", **base_meta},
-        )]
-    else:
-        oracle_inputs = _create_oracle_inputs(
-            acts_BLD_by_layer_dict=acts_by_layer,
-            target_input_ids=target_input_ids,
-            oracle_prompt=oracle_prompt,
-            act_layer=act_layer,
-            prompt_layer=act_layer,
-            tokenizer=tokenizer,
-            segment_start_idx=segment_start_idx,
-            segment_end_idx=segment_end_idx,
-            token_start_idx=token_start_idx,
-            token_end_idx=token_end_idx,
-            oracle_input_types=oracle_input_types,
-            segment_repeats=segment_repeats,
-            full_seq_repeats=full_seq_repeats,
-            batch_idx=0,
-            left_pad=left_pad,
-            base_meta=base_meta,
-        )
-
-    # Run oracle evaluation
-    if oracle_lora_path is not None:
-        model.set_adapter(oracle_lora_path)
-
-    responses = _run_evaluation(
-        eval_data=oracle_inputs,
+    # --- Expensive step: one forward sweep over the target model. -----------
+    # collect_base mirrors the old diff_against_base behaviour (gather base acts
+    # so the diff can be formed). The actual subtraction now happens lazily in
+    # run_oracle_from_activations via use_diff, so the same bundle could also
+    # serve a raw readout without a second collection.
+    target_acts = collect_target_activations_and_outputs(
         model=model,
         tokenizer=tokenizer,
-        submodule=injection_submodule,
         device=device,
-        dtype=dtype,
-        lora_path=oracle_lora_path,
-        eval_batch_size=eval_batch_size,
-        steering_coefficient=steering_coefficient,
-        generation_kwargs=generation_kwargs,
+        inputs_BL=inputs_BL,
+        target_lora_path=target_lora_path,
+        layer_percent=layer_percent,
+        collect_base=diff_against_base,
     )
 
-    # Aggregate results
-    token_responses = [None] * len(target_input_ids)
-    segment_responses = []
-    full_seq_responses = []
-
-    for r in responses:
-        meta = r.meta_info
-        dp_kind = meta["dp_kind"]
-        if dp_kind == "tokens":
-            token_responses[int(meta["token_index"])] = r.api_response
-        elif dp_kind == "segment":
-            segment_responses.append(r.api_response)
-        elif dp_kind == "full_seq":
-            full_seq_responses.append(r.api_response)
-
-    return OracleResults(
+    # --- Cheap step: build oracle inputs from the collected acts and evaluate.
+    return run_oracle_from_activations(
+        target_acts=target_acts,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        oracle_prompt=oracle_prompt,
         oracle_lora_path=oracle_lora_path,
+        use_diff=diff_against_base,
+        diff_topk=diff_topk,
         target_lora_path=target_lora_path,
         target_prompt=target_prompt,
-        act_key="lora",
-        oracle_prompt=oracle_prompt,
+        segment_start_idx=segment_start_idx,
+        segment_end_idx=segment_end_idx,
+        token_start_idx=token_start_idx,
+        token_end_idx=token_end_idx,
+        oracle_input_types=oracle_input_types,
+        generation_kwargs=generation_kwargs,
         ground_truth=ground_truth,
-        num_tokens=len(target_input_ids),
-        token_responses=token_responses,
-        full_sequence_responses=full_seq_responses,
-        segment_responses=segment_responses,
-        target_input_ids=target_input_ids,
+        segment_repeats=segment_repeats,
+        full_seq_repeats=full_seq_repeats,
+        eval_batch_size=eval_batch_size,
+        injection_layer=injection_layer,
+        steering_coefficient=steering_coefficient,
     )
 
 

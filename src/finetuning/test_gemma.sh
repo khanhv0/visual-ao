@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=00:10:00
+#SBATCH --time=00:25:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64GB # This is system memory, not GPU memory.
 #SBATCH --gpus=1
@@ -29,5 +29,9 @@ export OMP_NUM_THREADS=4  # match your --cpus-per-task
 # python train_sleeper.py 
 # python train_sleeper.py --validate-only checkpoints/sleeper_lora/final
 # python ao_test.py --layer-percent 75 # tried 50 and 25
-python ao_test.py --skip-check1 --check4 --n-compliant 6 --layer-percent 75
+# python ao_test.py --skip-check1 --check4 --n-compliant 6 --layer-percent 75
+# python ao_test.py --check4 --layer-percent 25 --last-n 10 --out-csv results/ao_smoke_test_layer25.csv
+#python ao_test.py --check4 --layer-percent 50 --last-n 10 --out-csv results/ao_smoke_test_layer50.csv
+python ao_test.py --check4 --layer-percent 50 --last-n 10 --out-csv results/ao_smoke_test_layer50_vtrigger_prompt.csv
+# python ao_test.py --check4 --layer-percent 75 --last-n 10 --out-csv results/ao_smoke_test_layer75.csv
 # python image_leak_diag.py
