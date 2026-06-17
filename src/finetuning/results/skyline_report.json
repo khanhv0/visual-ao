@@ -1,0 +1,100 @@
+{
+  "results": [
+    {
+      "layer": 31,
+      "mode": "diff",
+      "pool": "mean",
+      "n": 33,
+      "n_pos": 13,
+      "cv_mean": 0.9652380952380952,
+      "cv_std": 0.06821501287736748,
+      "folds": 5,
+      "null_mean": 0.5485428571428571,
+      "null_p95": 0.6763095238095238,
+      "p_value": 0.0,
+      "pca_components": 24,
+      "elapsed_s": 82.4
+    },
+    {
+      "layer": 31,
+      "mode": "diff",
+      "pool": "last",
+      "n": 33,
+      "n_pos": 13,
+      "cv_mean": 1.0,
+      "cv_std": 0.0,
+      "folds": 5,
+      "null_mean": 0.531445238095238,
+      "null_p95": 0.6707619047619048,
+      "p_value": 0.0,
+      "pca_components": 24,
+      "elapsed_s": 63.3
+    },
+    {
+      "layer": 31,
+      "mode": "raw",
+      "pool": "mean",
+      "n": 33,
+      "n_pos": 13,
+      "cv_mean": 0.7195238095238095,
+      "cv_std": 0.197621342499584,
+      "folds": 5,
+      "null_mean": 0.5368333333333334,
+      "null_p95": 0.6741428571428569,
+      "p_value": 0.035,
+      "pca_components": 24,
+      "elapsed_s": 70.4
+    },
+    {
+      "layer": 31,
+      "mode": "raw",
+      "pool": "last",
+      "n": 33,
+      "n_pos": 13,
+      "cv_mean": 1.0,
+      "cv_std": 0.0,
+      "folds": 5,
+      "null_mean": 0.5270119047619047,
+      "null_p95": 0.6676428571428571,
+      "p_value": 0.0,
+      "pca_components": 24,
+      "elapsed_s": 67.3
+    }
+  ],
+  "decision": {
+    "route": "PASS",
+    "message": "Directive is linearly legible in the diff (above the permutation null and past the pass threshold). Signal exists; the bottleneck is AO transfer. Proceed to probe_confound_control.py, then ao_bridge.py on this layer/pool.",
+    "best_diff": {
+      "layer": 31,
+      "mode": "diff",
+      "pool": "last",
+      "n": 33,
+      "n_pos": 13,
+      "cv_mean": 1.0,
+      "cv_std": 0.0,
+      "folds": 5,
+      "null_mean": 0.531445238095238,
+      "null_p95": 0.6707619047619048,
+      "p_value": 0.0,
+      "pca_components": 24,
+      "elapsed_s": 63.3
+    },
+    "best_raw": {
+      "layer": 31,
+      "mode": "raw",
+      "pool": "last",
+      "n": 33,
+      "n_pos": 13,
+      "cv_mean": 1.0,
+      "cv_std": 0.0,
+      "folds": 5,
+      "null_mean": 0.5270119047619047,
+      "null_p95": 0.6676428571428571,
+      "p_value": 0.0,
+      "pca_components": 24,
+      "elapsed_s": 67.3
+    },
+    "pass_threshold": 0.8,
+    "chance_band": 0.6
+  }
+}

@@ -650,7 +650,11 @@ def eval_features_batch(
 
     with add_hook(submodule, hook_fn):
         output_ids = model.generate(**tokenized_input, **generation_kwargs)
-
+    # -------------- DEBUG: TODO: Delete when done-----------------------
+    print("PROMPT:", repr(decoded_prompts[0][-300:]))
+    print("OUTPUT IDS SHAPE:", output_ids.shape, "INPUT SHAPE:", eval_batch.input_ids.shape)
+    print("GEN TOKENS:", output_ids[0, eval_batch.input_ids.shape[1]:].tolist()[:20])
+    #-----------------------------------------------
     generated_tokens = output_ids[:, eval_batch.input_ids.shape[1]:]
     decoded_output = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
@@ -1040,7 +1044,7 @@ def run_oracle_from_activations(
     full_seq_repeats: int = 1,
     eval_batch_size: int = 32,
     injection_layer: int = 1,
-    steering_coefficient: float = 1.0,
+    steering_coefficient: float = 2.0, #TODO: change to 2
 ) -> OracleResults:
     """
     The cheap back-half of run_oracle: build oracle inputs from ALREADY-collected
