@@ -678,12 +678,16 @@ def _run_evaluation(
     eval_batch_size: int,
     steering_coefficient: float,
     generation_kwargs: dict,
+    manage_adapters:bool,   # NEW
 ) -> list[FeatureResult]:
-    if lora_path is not None:
-        adapter_name = lora_path
-        if adapter_name not in model.peft_config:
-            model.load_adapter(lora_path, adapter_name=adapter_name, is_trainable=False, low_cpu_mem_usage=True)
-        model.set_adapter(adapter_name)
+    # ---- Set all adapters if provided, else fall back to single lora_path ----
+    if manage_adapters:   # <-- only touch adapters if allowed
+        if lora_path is not None:
+            adapter_name = lora_path
+            if adapter_name not in model.peft_config:
+                model.load_adapter(lora_path, adapter_name=adapter_name,
+                                   is_trainable=False, low_cpu_mem_usage=True)
+            model.set_adapter(adapter_name)
 
     with torch.no_grad():
         all_feature_results = []
@@ -1029,6 +1033,7 @@ def run_oracle_from_activations(
     *,
     oracle_prompt: str,
     oracle_lora_path: str | None,
+    additional_oracle_lora_paths: list[str] | None = None, # TODO: multiple adapters option
     use_diff: bool = False,
     diff_topk: int | None = None,
     target_lora_path: str | None = None,
@@ -1115,8 +1120,33 @@ def run_oracle_from_activations(
             base_meta=base_meta,
         )
 
+    # SET ACTIVE ORACLE ADAPTER(S)
+     # ---- load all required adapters ----
+    adapter_names = []
     if oracle_lora_path is not None:
-        model.set_adapter(oracle_lora_path)
+        name = sanitize_lora_name(oracle_lora_path)
+        if name not in model.peft_config:
+            model.load_adapter(oracle_lora_path, adapter_name=name,
+                               is_trainable=False, low_cpu_mem_usage=True)
+        adapter_names.append(name)
+
+    if additional_oracle_lora_paths:
+        for path in additional_oracle_lora_paths:
+            name = sanitize_lora_name(path)
+            if name not in model.peft_config:
+                model.load_adapter(path, adapter_name=name,
+                                   is_trainable=False, low_cpu_mem_usage=True)
+            adapter_names.append(name)
+
+    # ---- activate the right adapter(s) ----
+    if not adapter_names:
+        if hasattr(model, "peft_config") and model.peft_config:
+            model.base_model.disable_adapter_layers()
+    elif len(adapter_names) == 1:
+        model.set_adapter(adapter_names[0])
+    else:
+        # PeftModel.set_adapter rejects lists; the list form is on the tuner.
+        model.base_model.set_adapter(adapter_names)
 
     responses = _run_evaluation(
         eval_data=oracle_inputs,
@@ -1129,6 +1159,7 @@ def run_oracle_from_activations(
         eval_batch_size=eval_batch_size,
         steering_coefficient=steering_coefficient,
         generation_kwargs=generation_kwargs,
+        manage_adapters=False,
     )
 
     token_responses = [None] * len(target_input_ids)
@@ -1171,6 +1202,7 @@ def run_oracle(
     # Oracle model params
     oracle_prompt: str,
     oracle_lora_path: str | None,
+    more_ao_adapters: bool | None = True,
     # Target inputs/prompts
     target_prompt: str | None = None,
     target_inputs: dict | None = None,
@@ -1260,6 +1292,7 @@ def run_oracle(
         device=device,
         oracle_prompt=oracle_prompt,
         oracle_lora_path=oracle_lora_path,
+        additional_oracle_lora_paths=[target_lora_path] if target_lora_path and more_ao_adapters else None,
         use_diff=diff_against_base,
         diff_topk=diff_topk,
         target_lora_path=target_lora_path,

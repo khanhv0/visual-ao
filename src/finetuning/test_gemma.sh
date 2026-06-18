@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --time=00:15:00
+#SBATCH --time=00:10:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64GB # This is system memory, not GPU memory.
+#SBATCH --mem=32GB # This is system memory, not GPU memory.
 #SBATCH --gpus=1
 #SBATCH --partition=gpu-a100-80g  # Change back to a100
 #SBATCH --output logs/ao_probe.%J.out
@@ -36,6 +36,7 @@ export OMP_NUM_THREADS=4  # match your --cpus-per-task
 # python ao_test.py --check4 --layer-percent 90 --out-csv results/ao_smoke_test_layer90_steering2.csv --diff-topk 16
 # python ao_test.py --check4 --layer-percent 75 --last-n 10 --out-csv results/ao_smoke_test_layer75.csv
 # python image_leak_diag.py
+python ao_test.py --check4 --layer-percent 50 --last-n 10 --out-csv results/ao_smoke_test_layer50_double_adapter_steering2.csv
 # ---------------------------------------------------------------------
 # Probe training data collection
 # python gen_probe_data.py --sleeper checkpoints/sleeper_lora/final
@@ -47,4 +48,4 @@ export OMP_NUM_THREADS=4  # match your --cpus-per-task
 # ----------------------------------------------------------------------
 #python probe_confound_control.py   # is it directive or projector?
 
-python ao_bridge.py --layer_percent 50
+#python ao_bridge.py --layer_percent 50

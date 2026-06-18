@@ -233,6 +233,7 @@ def probe_image(model, tokenizer, processor, device, ao_adapter, sleeper_adapter
             oracle_prompt=oracle_prompt, oracle_lora_path=ao_adapter,
             use_diff=use_diff, diff_topk=(diff_topk if use_diff else None),
             target_lora_path=sleeper_adapter, target_prompt=target_prompt,
+            additional_oracle_lora_paths=[sleeper_adapter],
             oracle_input_types=oracle_input_types,
             segment_start_idx=segment_start, segment_end_idx=None,
             generation_kwargs=GEN_KWARGS, ground_truth=TARGET_URL,
@@ -320,6 +321,7 @@ def check1_text_taboo(model, processor, tokenizer, ao_adapter, layer_percent,
         ground_truth=secret,
         layer_percent=layer_percent,
         injection_layer=1,
+        more_ao_adapters=True, # TODO: change this back to false if single ao adapter only
     )
 
     any_hit = emit_responses(
@@ -373,6 +375,7 @@ def check2_benign_crossmodal(model, processor, tokenizer, ao_adapter,
             generation_kwargs=GEN_KWARGS,
             layer_percent=layer_percent,
             injection_layer=1,
+            more_ao_adapters=True, # TODO: change this back to false if single ao adapter only
         )
 
         any_sensible = emit_responses(

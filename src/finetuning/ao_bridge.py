@@ -59,7 +59,7 @@ def _run_one(model, processor, tokenizer, device, cfg: ProbeConfig, img, layer_p
         oracle_lora_path=oracle_adapter_name,    # "ao", not the file path
         target_inputs=inputs_BL,
         oracle_input_types=["segment"],
-        segment_start_idx = segment_start_idx, # TODO: change o lkast token
+        segment_start_idx = segment_start_idx, # TODO: change to last token
         segment_end_idx = None,
         layer_percent=layer_percent,
         diff_against_base=cfg.bridge_use_diff,
@@ -69,9 +69,9 @@ def _run_one(model, processor, tokenizer, device, cfg: ProbeConfig, img, layer_p
     # TODO: change to full seq or whatever if oracle input type changes
     if res.full_sequence_responses:
         return res.full_sequence_responses[0]
-    else if res.segment_response:
+    elif res.segment_response:
         return res.segment_responses[0]
-    else
+    else:
         return ""
 
 
